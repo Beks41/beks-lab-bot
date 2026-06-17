@@ -2,7 +2,7 @@
 BEKS Lab — Telegram Bot + API Server
 aiogram 3.x + aiohttp + SQLite + Gemini API
 """
-import os, logging, sqlite3, json, hashlib, hmac
+import os, logging, sqlite3, json, hashlib, hmac, asyncio
 from urllib.parse import parse_qs
 from aiohttp import web
 import aiohttp as aio_client
@@ -93,39 +93,60 @@ def get_tid(req):
     return None
 
 # ---- Gemini ----
-async def gemini(prompt, img_b64=None, mime="image/jpeg"):
+GEMINI_MODEL = "gemini-2.5-flash"
+
+async def gemini(prompt, img_b64=None, mime="image/jpeg", max_retries=3):
     if not GEMINI_KEY:
         log.error("GEMINI_KEY не задан в переменных окружения")
         return "Gemini API ключ не настроен."
     parts = []
     if img_b64: parts.append({"inline_data":{"mime_type":mime,"data":img_b64}})
     parts.append({"text":prompt})
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
-    try:
-        async with aio_client.ClientSession() as s:
-            async with s.post(url, json={"contents":[{"parts":parts}]}) as r:
-                body_text = await r.text()
-                if r.status != 200:
-                    log.error(f"Gemini HTTP {r.status}: {body_text[:1000]}")
-                    return f"Ошибка AI (HTTP {r.status}): {body_text[:300]}"
-                try:
-                    d = json.loads(body_text)
-                except Exception as e:
-                    log.error(f"Gemini: не удалось разобрать JSON ответа: {e} | raw: {body_text[:500]}")
-                    return "AI вернул нечитаемый ответ."
-                try:
-                    return d["candidates"][0]["content"]["parts"][0]["text"]
-                except Exception as e:
-                    log.error(f"Gemini: неожиданная структура ответа: {e} | raw: {body_text[:800]}")
-                    finish_reason = None
-                    try: finish_reason = d["candidates"][0].get("finishReason")
-                    except Exception: pass
-                    if finish_reason:
-                        return f"AI не смог обработать (finishReason={finish_reason})."
-                    return "AI не смог обработать."
-    except Exception as e:
-        log.error(f"Gemini: исключение при запросе: {repr(e)}")
-        return f"Ошибка сети при обращении к AI: {repr(e)[:200]}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+
+    last_error = "Ошибка AI."
+    for attempt in range(max_retries):
+        try:
+            async with aio_client.ClientSession() as s:
+                async with s.post(url, json={"contents":[{"parts":parts}]}) as r:
+                    body_text = await r.text()
+
+                    if r.status == 429:
+                        log.warning(f"Gemini 429 (попытка {attempt+1}/{max_retries}): {body_text[:300]}")
+                        last_error = f"Ошибка AI (HTTP 429): {body_text[:300]}"
+                        if attempt < max_retries - 1:
+                            wait = 2 * (attempt + 1)  # 2с, 4с, 6с
+                            await asyncio.sleep(wait)
+                            continue
+                        return "Сервис AI сейчас перегружен (лимит запросов). Подожди немного и попробуй снова."
+
+                    if r.status != 200:
+                        log.error(f"Gemini HTTP {r.status}: {body_text[:1000]}")
+                        return f"Ошибка AI (HTTP {r.status}): {body_text[:300]}"
+
+                    try:
+                        d = json.loads(body_text)
+                    except Exception as e:
+                        log.error(f"Gemini: не удалось разобрать JSON ответа: {e} | raw: {body_text[:500]}")
+                        return "AI вернул нечитаемый ответ."
+                    try:
+                        return d["candidates"][0]["content"]["parts"][0]["text"]
+                    except Exception as e:
+                        log.error(f"Gemini: неожиданная структура ответа: {e} | raw: {body_text[:800]}")
+                        finish_reason = None
+                        try: finish_reason = d["candidates"][0].get("finishReason")
+                        except Exception: pass
+                        if finish_reason:
+                            return f"AI не смог обработать (finishReason={finish_reason})."
+                        return "AI не смог обработать."
+        except Exception as e:
+            log.error(f"Gemini: исключение при запросе (попытка {attempt+1}): {repr(e)}")
+            last_error = f"Ошибка сети при обращении к AI: {repr(e)[:200]}"
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+
+    return last_error
 
 # ---- CORS ----
 CH = {"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization"}
