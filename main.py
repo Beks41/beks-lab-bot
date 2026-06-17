@@ -1,7 +1,6 @@
 """
 BEKS Lab — Telegram Bot Server
 Стек: aiogram 3.x + aiohttp + SQLite
-Хостинг: Railway.app (бесплатно)
 """
 
 import os
@@ -15,16 +14,17 @@ from aiogram.types import (
     WebAppInfo,
     MenuButtonWebApp,
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ---------- Конфиг ----------
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]                # токен от @BotFather
-WEBAPP_URL = os.environ["WEBAPP_URL"]               # URL фронтенда на Vercel (например https://beks-lab.vercel.app)
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")       # @твой_канал (опционально, для проверки подписки)
-CHAT_ID = os.environ.get("CHAT_ID", "")             # @твой_чат (опционально)
-WEBHOOK_HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")  # Railway сам подставит
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+WEBAPP_URL = os.environ["WEBAPP_URL"]
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+WEBHOOK_HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -34,10 +34,9 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("beks-bot")
 
-# ---------- База данных (SQLite) ----------
+# ---------- База данных ----------
 
 def init_db():
-    """Создаёт таблицу пользователей если её нет."""
     conn = sqlite3.connect("beks.db")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -52,14 +51,26 @@ def init_db():
     conn.close()
 
 def save_user(user: types.User):
-    """Сохраняет или обновляет пользователя."""
     conn = sqlite3.connect("beks.db")
     conn.execute(
-        "INSERT OR REPLACE INTO users (tg_id, username, first_name) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO users (tg_id, username, first_name) VALUES (?, ?, ?)",
         (user.id, user.username, user.first_name),
     )
     conn.commit()
     conn.close()
+
+def set_pro(tg_id: int, status: int = 1):
+    conn = sqlite3.connect("beks.db")
+    conn.execute("UPDATE users SET is_pro = ? WHERE tg_id = ?", (status, tg_id))
+    conn.commit()
+    conn.close()
+
+def is_pro(tg_id: int) -> bool:
+    conn = sqlite3.connect("beks.db")
+    cur = conn.execute("SELECT is_pro FROM users WHERE tg_id = ?", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
 
 def get_user_count() -> int:
     conn = sqlite3.connect("beks.db")
@@ -68,19 +79,24 @@ def get_user_count() -> int:
     conn.close()
     return count
 
+def get_pro_count() -> int:
+    conn = sqlite3.connect("beks.db")
+    cur = conn.execute("SELECT COUNT(*) FROM users WHERE is_pro = 1")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
 # ---------- Проверка подписки на канал ----------
 
 async def check_subscription(user_id: int) -> bool:
-    """Проверяет, подписан ли пользователь на канал и чат."""
     if not CHANNEL_ID:
-        return True  # если канал не задан — пропускаем
-
+        return True
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
         if member.status in ("left", "kicked"):
             return False
     except Exception:
-        return True  # если ошибка — пропускаем проверку
+        return True
 
     if CHAT_ID:
         try:
@@ -89,21 +105,16 @@ async def check_subscription(user_id: int) -> bool:
                 return False
         except Exception:
             pass
-
     return True
 
 # ---------- Хендлеры ----------
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    """Обработка /start."""
     save_user(message.from_user)
-
-    # Проверяем подписку
     is_subscribed = await check_subscription(message.from_user.id)
 
     if not is_subscribed:
-        # Показываем экран "Доступ закрыт"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}"),
@@ -121,7 +132,6 @@ async def cmd_start(message: types.Message):
             parse_mode="Markdown",
         )
     else:
-        # Показываем кнопку открытия mini-app
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -130,8 +140,9 @@ async def cmd_start(message: types.Message):
                 ),
             ],
         ])
+        pro_status = "⭐ PRO активен" if is_pro(message.from_user.id) else ""
         await message.answer(
-            "✅ Добро пожаловать в **BEKS Lab**!\n\n"
+            f"✅ Добро пожаловать в **BEKS Lab**!\n{pro_status}\n\n"
             "Нажми кнопку ниже, чтобы открыть приложение.",
             reply_markup=kb,
             parse_mode="Markdown",
@@ -140,9 +151,7 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(callback: types.CallbackQuery):
-    """Повторная проверка подписки."""
     is_subscribed = await check_subscription(callback.from_user.id)
-
     if is_subscribed:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -160,15 +169,79 @@ async def check_sub_callback(callback: types.CallbackQuery):
         await callback.answer("Ты ещё не подписался на канал и чат.", show_alert=True)
 
 
+# ---------- Админ-команды ----------
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: types.Message):
+    """Показывает Telegram ID пользователя."""
+    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+@dp.message(Command("pro"))
+async def cmd_pro(message: types.Message):
+    """Админ выдаёт PRO себе или другому пользователю."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            target_id = int(args[1])
+        except ValueError:
+            await message.answer("Используй: /pro 123456789")
+            return
+    else:
+        target_id = message.from_user.id
+
+    set_pro(target_id, 1)
+    await message.answer(f"✅ PRO активирован для `{target_id}`", parse_mode="Markdown")
+
+
+@dp.message(Command("unpro"))
+async def cmd_unpro(message: types.Message):
+    """Админ забирает PRO."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            target_id = int(args[1])
+        except ValueError:
+            await message.answer("Используй: /unpro 123456789")
+            return
+    else:
+        target_id = message.from_user.id
+
+    set_pro(target_id, 0)
+    await message.answer(f"❌ PRO деактивирован для `{target_id}`", parse_mode="Markdown")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Админ смотрит статистику."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    total = get_user_count()
+    pro = get_pro_count()
+    await message.answer(
+        f"📊 **Статистика BEKS Lab**\n\n"
+        f"Всего пользователей: {total}\n"
+        f"PRO подписчиков: {pro}",
+        parse_mode="Markdown",
+    )
+
+
 # ---------- Запуск ----------
 
 async def on_startup(app: web.Application):
-    """Устанавливаем webhook при старте."""
     init_db()
     webhook_url = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
     await bot.set_webhook(webhook_url)
-
-    # Устанавливаем кнопку Mini App в меню бота
     try:
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(
@@ -178,13 +251,11 @@ async def on_startup(app: web.Application):
         )
     except Exception as e:
         log.warning(f"Не удалось установить menu button: {e}")
-
     log.info(f"Webhook set: {webhook_url}")
     log.info(f"Users in DB: {get_user_count()}")
 
 
 async def on_shutdown(app: web.Application):
-    """Удаляем webhook при остановке."""
     await bot.delete_webhook()
     await bot.session.close()
 
@@ -194,17 +265,14 @@ def main():
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    # Подключаем webhook handler
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
-    # Простой health-check endpoint (Railway хочет видеть живой HTTP)
     async def health(request):
         return web.json_response({"status": "ok", "users": get_user_count()})
 
     app.router.add_get("/", health)
-
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 
