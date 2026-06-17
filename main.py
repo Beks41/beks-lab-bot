@@ -374,8 +374,13 @@ async def api_settings(req):
 
 async def api_analyze(req):
     tid = get_tid(req)
-    try: body = await req.json(); img = body.get("image"); mime = body.get("mime","image/jpeg")
-    except: return web.json_response({"error":"bad"},status=400,headers=CH)
+    try:
+        body = await req.json()
+        img = body.get("image")
+        mime = body.get("mime","image/jpeg")
+    except Exception as e:
+        log.error(f"api_analyze: не удалось разобрать тело запроса: {repr(e)}")
+        return web.json_response({"error": f"bad request body: {repr(e)[:200]}"}, status=400, headers=CH)
     if not img: return web.json_response({"error":"no image"},status=400,headers=CH)
     prompt = ("Проанализируй внешность по фото для приложения BEKS Lab. "
         "Дай структурированный разбор по 4 зонам: Кожа, Брови/взгляд, Волосы/причёска, Общий стиль. "
@@ -521,7 +526,7 @@ async def on_shutdown(app):
     await bot.delete_webhook(); await bot.session.close()
 
 def main():
-    app = web.Application(middlewares=[cors_mw])
+    app = web.Application(middlewares=[cors_mw], client_max_size=20*1024*1024)  # 20MB — достаточно для фото в base64
     app.on_startup.append(on_startup); app.on_shutdown.append(on_shutdown)
     wh = SimpleRequestHandler(dispatcher=dp, bot=bot); wh.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
