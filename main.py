@@ -47,6 +47,17 @@ def init_db():
             summary TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS meals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kcal INTEGER DEFAULT 0,
+            protein INTEGER DEFAULT 0,
+            fat INTEGER DEFAULT 0,
+            carbs INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     c.commit(); c.close()
 
@@ -96,6 +107,28 @@ def get_analysis(tid, aid):
     c.close()
     if not r: return None
     return {"report": r["report"], "created_at": r["created_at"]}
+
+def save_meal(tid, day, name, kcal, protein, fat, carbs):
+    c = get_db()
+    c.execute("INSERT OR IGNORE INTO users(tg_id) VALUES(?)", (tid,))
+    c.execute("INSERT INTO meals(tg_id,day,name,kcal,protein,fat,carbs) VALUES(?,?,?,?,?,?,?)",
+              (tid, day, name, kcal, protein, fat, carbs))
+    c.commit(); c.close()
+
+def delete_meal(tid, meal_id):
+    c = get_db()
+    c.execute("DELETE FROM meals WHERE id=? AND tg_id=?", (meal_id, tid))
+    c.commit(); c.close()
+
+def get_meals(tid, day):
+    c = get_db()
+    rows = c.execute(
+        "SELECT id, name, kcal, protein, fat, carbs FROM meals WHERE tg_id=? AND day=? ORDER BY id ASC",
+        (tid, day)
+    ).fetchall()
+    c.close()
+    return [{"id": r["id"], "name": r["name"], "kcal": r["kcal"],
+             "protein": r["protein"], "fat": r["fat"], "carbs": r["carbs"]} for r in rows]
 
 # ---- Guides content (Академия) ----
 # Категория "Кожа" — полный набор гайдов. Остальные категории (Волосы, Брови, Стиль,
@@ -411,6 +444,7 @@ async def api_analysis_detail(req):
     return web.json_response(a, headers=CH)
 
 async def api_calories(req):
+    tid = get_tid(req)
     try: body = await req.json(); meal = body.get("meal","")
     except: return web.json_response({"error":"bad"},status=400,headers=CH)
     if not meal: return web.json_response({"error":"no meal"},status=400,headers=CH)
@@ -418,9 +452,32 @@ async def api_calories(req):
     r = await gemini(prompt)
     try:
         clean = r.replace("```json","").replace("```","").strip()
-        return web.json_response(json.loads(clean),headers=CH)
+        data = json.loads(clean)
+        if tid:
+            from datetime import date
+            day = str(date.today())
+            save_meal(tid, day, meal, data.get("kcal",0), data.get("protein",0), data.get("fat",0), data.get("carbs",0))
+        return web.json_response(data, headers=CH)
     except:
         return web.json_response({"error":"parse","raw":r},status=500,headers=CH)
+
+async def api_meals_get(req):
+    tid = get_tid(req)
+    if not tid: return web.json_response({"error":"no tg_id"},status=400,headers=CH)
+    from datetime import date
+    day = req.query.get("day", str(date.today()))
+    meals = get_meals(tid, day)
+    return web.json_response({"meals": meals, "day": day}, headers=CH)
+
+async def api_meal_delete(req):
+    tid = get_tid(req)
+    if not tid: return web.json_response({"error":"no tg_id"},status=400,headers=CH)
+    try:
+        body = await req.json()
+        meal_id = int(body.get("id", 0))
+    except: return web.json_response({"error":"bad"},status=400,headers=CH)
+    delete_meal(tid, meal_id)
+    return web.json_response({"ok": True}, headers=CH)
 
 async def api_chat(req):
     tid = get_tid(req)
@@ -540,6 +597,8 @@ def main():
     app.router.add_get("/api/analysis", api_analysis_detail)
     app.router.add_get("/api/guides", api_guides_list)
     app.router.add_get("/api/guide", api_guide_detail)
+    app.router.add_get("/api/meals", api_meals_get)
+    app.router.add_delete("/api/meal", api_meal_delete)
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__=="__main__": main()
